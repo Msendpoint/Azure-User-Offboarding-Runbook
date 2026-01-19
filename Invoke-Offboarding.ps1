@@ -3,29 +3,69 @@
     Made By Souhaiel MORHAG
     Check MSEndpoint.com for more Info
     01/19/2026
-    Automated User Offboarding for Office 365 (Exchange Online).
+    Automated User Offboarding with Governance & Approval Tracking.
     Handles forwarding, shared mailbox conversion, permissions, OOF, and compliance logging.
 
 .DESCRIPTION
     This script is designed to be run as an Azure Automation Runbook (PowerShell 7.2).
     It performs the following actions in order:
-    1. Authenticates via Managed Identity (requires Exchange.ManageAsApp).
+    1. Authenticates via Managed Identity.
     2. Converts the source User Mailbox to a Shared Mailbox (optional).
     3. Grants 'Full Access' and 'Send As' permissions to target delegates.
     4. Configures Email Forwarding (Internal/External) and toggles 'Keep Copy'.
     5. Sets an Automatic Reply (Out of Office) with a dynamic template.
-    6. Logs the operation to Azure Table Storage (for audit and auto-cleanup).
-    7. Sends a detailed notification email (e.g., to ServiceNow or IT Support).
+    6. Logs the operation AND Governance data (Ticket Ref, Proof URL) to Azure Table Storage.
+    7. Sends a detailed notification email with links to the proof.
 
-.NOTES
-    Version:     1.0
-    Prerequisites: ExchangeOnlineManagement, Az.Storage, Az.Accounts modules.
+.PARAMETER ApprovalTicketRef
+    REQUIRED. The Service Management ticket number authorizing this request (e.g., "INC0012345", "RITM9999").
+    
+.PARAMETER ApprovalDocLink
+    OPTIONAL. A URL to the signed PDF/Email approval (SharePoint link or Blob URL) for audit.
 
-.LINK
-    https://github.com/votre-username/Azure-User-Offboarding
+.PARAMETER SourceUserEmail
+    The email of the departing user.
+
+.PARAMETER TargetUserEmail
+    The primary email for forwarding (User Y).
+
+.PARAMETER AdditionalDelegates
+    Comma-separated list of OTHER emails that need permissions.
+
+.PARAMETER ConvertToShared
+    Bool. If true, converts to Shared Mailbox.
+
+.PARAMETER DeliverToMailboxAndForward
+    Bool. If true, keeps a copy of the email in the source mailbox.
+
+.PARAMETER GrantFullAccess
+    Bool. Grant 'Full Access' (Read/Manage).
+
+.PARAMETER GrantSendAs
+    Bool. Grant 'Send As' rights.
+
+.PARAMETER OofTemplate
+    String. "LeftCompany", "LongLeave", "None".
+
+.PARAMETER OofEndDate
+    DateTime. When to stop the auto-reply (usually same as forwarding duration).
+
+.PARAMETER AuditStorageAccountName
+    Azure Storage Account for logging.
+
+.PARAMETER NotificationEmail
+    Who receives the final report.
 #>
 
 param(
+    # --- GOVERNANCE PARAMETERS (NEW) ---
+    [Parameter(Mandatory=$true)]
+    [string]$ApprovalTicketRef,  # e.g., INC123456
+
+    [Parameter(Mandatory=$false)]
+    [string]$ApprovalDocLink,    # e.g., https://sharepoint.../approval.pdf
+
+    # --- TECHNICAL PARAMETERS ---
     [Parameter(Mandatory=$true)]
     [string]$SourceUserEmail,
 
@@ -33,7 +73,7 @@ param(
     [string]$TargetUserEmail,
 
     [Parameter(Mandatory=$false)]
-    [string]$AdditionalDelegates, # Format: "manager@domain.com,hr@domain.com"
+    [string]$AdditionalDelegates, 
 
     [Parameter(Mandatory=$true)]
     [bool]$ConvertToShared,
@@ -61,11 +101,11 @@ param(
     [string]$NotificationEmail
 )
 
-# --- CONFIGURATION (UPDATE THESE BEFORE RUNNING) ---
+# --- CONFIGURATION (UPDATE THESE BEFORE DEPLOYING) ---
 $OrganizationDomain = "yourtenant.onmicrosoft.com"  # TODO: Replace with your Tenant Domain
 $StorageResourceGroup = "rg-automation-prod"        # TODO: Replace with your Storage Account's Resource Group
 $SenderEmailAddress   = "noreply@yourdomain.com"    # TODO: Replace with a valid sender email for notifications
-# -------------------------------------------------
+# -----------------------------------------------------
 
 # 1. AUTHENTICATION
 try {
@@ -80,6 +120,7 @@ catch {
 
 $logEntries = @()
 $logEntries += "Start Time: $(Get-Date)"
+$logEntries += "<strong>Governance:</strong> Ticket Ref: $ApprovalTicketRef"
 
 # 2. CONVERSION (TO SHARED)
 if ($ConvertToShared) {
@@ -101,12 +142,16 @@ if (-not [string]::IsNullOrWhiteSpace($AdditionalDelegates)) {
 
 foreach ($user in $usersToGrant) {
     $user = $user.Trim()
+    
+    # Grant Full Access
     if ($GrantFullAccess) {
         try {
             Add-MailboxPermission -Identity $SourceUserEmail -User $user -AccessRights FullAccess -InheritanceType All -AutoMapping $false -ErrorAction Stop
             $logEntries += "SUCCESS: Granted Full Access to $user"
         } catch { $logEntries += "ERROR: Failed Full Access for $user ($($_))" }
     }
+
+    # Grant Send As
     if ($GrantSendAs) {
         try {
             Add-RecipientPermission -Identity $SourceUserEmail -Trustee $user -AccessRights SendAs -Confirm:$false -ErrorAction Stop
@@ -160,26 +205,42 @@ try {
         "UserEmail"    = $SourceUserEmail;
         "Action"       = "DisableForwarding";
         "ExpiryDate"   = $OofEndDate;
-        "Status"       = "Active"
+        "Status"       = "Active";
+        "TicketRef"    = $ApprovalTicketRef;
+        "ProofUrl"     = $ApprovalDocLink
     } -ErrorAction Ignore
-    $logEntries += "SUCCESS: Audit logged to Table Storage. Scheduled for cleanup on $OofEndDate."
+    $logEntries += "SUCCESS: Audit logged to Table Storage (Ticket: $ApprovalTicketRef). Cleanup scheduled on $OofEndDate."
 }
 catch {
     $logEntries += "WARNING: Failed to write to Azure Table. Cleanup might fail. Error: $_"
 }
 
 # 7. REPORTING (EMAIL NOTIFICATION)
-# Using Graph for sending mail
-$emailSubject = "Offboarding Report: $SourceUserEmail"
-$finalReport = $logEntries -join "<br>"
-$emailBody = @{
-    ContentType = "HTML"
-    Content     = "<h2>Offboarding Execution Report</h2><p>$finalReport</p>"
+$proofHtml = ""
+if (-not [string]::IsNullOrEmpty($ApprovalDocLink)) {
+    $proofHtml = "<p><strong>Approval Attachment:</strong> <a href='$ApprovalDocLink'>View Authorized Proof</a></p>"
 }
+
+$emailSubject = "Offboarding Complete: $SourceUserEmail (Ticket $ApprovalTicketRef)"
+$finalReportLogs = $logEntries -join "<br>"
+
+$emailBodyHtml = @"
+<h2>Offboarding Execution Report</h2>
+<div style='background-color:#f0f0f0; padding:15px; border-left: 5px solid #0078D4; margin-bottom: 20px;'>
+    <h3 style='margin-top:0;'>Governance & Authorization</h3>
+    <p><strong>ServiceNow Ticket:</strong> $ApprovalTicketRef</p>
+    $proofHtml
+    <p><strong>Executed By:</strong> Azure Automation (Managed Identity)</p>
+    <p><strong>Expiry Date:</strong> $OofEndDate</p>
+</div>
+<hr>
+<h3>Technical Execution Log</h3>
+<p>$finalReportLogs</p>
+"@
 
 $message = @{
     Subject = $emailSubject
-    Body    = $emailBody
+    Body    = @{ ContentType = "HTML"; Content = $emailBodyHtml }
     ToRecipients = @(@{ EmailAddress = @{ Address = $NotificationEmail } })
 }
 
